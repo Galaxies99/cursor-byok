@@ -17,7 +17,7 @@ use cursor_server::{
     api::cursor,
     cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::protocol::{
-        connect,
+        connect, events,
         proto::{agent::v1 as pb, aiserver::v1 as ai},
     },
     cursor::transport::TransportRegistry,
@@ -92,6 +92,57 @@ fn captured_kv_ack_hex_decodes_as_agent_client_message() {
         kv.message,
         Some(pb::kv_client_message::Message::SetBlobResult(_))
     ));
+}
+
+#[tokio::test]
+async fn bidi_append_routes_binary_agent_messages() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let clients = NetworkClients::new(store.clone());
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(fake_provider::FakeProvider::default()),
+        PromptCompiler::new(assets),
+    );
+    let handle = registry.get_or_create("binary-request").await.unwrap();
+    let mut output = handle.subscribe();
+    let message = pb::AgentClientMessage {
+        message: Some(pb::agent_client_message::Message::ClientHeartbeat(
+            pb::ClientHeartbeat::default(),
+        )),
+    };
+    let wire = ai::BidiAppendRequest {
+        request_id: Some(ai::BidiRequestId {
+            request_id: "binary-request".into(),
+        }),
+        data_binary: message.encode_to_vec(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+
+    let response = cursor::router(registry, clients)
+        .unwrap()
+        .oneshot(
+            Request::post("/aiserver.v1.BidiService/BidiAppend")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(wire))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), output.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let message: pb::AgentServerMessage = fake_cursor::decode_single(&frame).unwrap();
+    assert_eq!(message, events::heartbeat());
 }
 
 #[tokio::test]
